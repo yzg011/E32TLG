@@ -1,3 +1,26 @@
+/* ============================================================================
+   E32TLG 中文版 v2 —— 按键响应优化版（修正 Arduino 原型报错）
+   ESP32 + SH1106 128x64 (I2C) + 旋转编码器 + Telegram 家庭留言机
+
+   ★ 修复：tusBaslat / tusOku 不再使用自定义 struct Tus
+     Arduino 会把函数原型插到文件最前面，此时 struct 还没声明 → 编译报错。
+     现在改成 3 组数组 + int 索引（TUS_ENC / TUS_BACK / TUS_CONF）。
+
+   ★ v2 改动
+     1) Telegram 轮询放到 core 0 的独立任务，主循环不被 getUpdates 阻塞。
+     2) 按键非阻塞状态机：15ms 去抖 + millis 判长按，按下即响应。
+     3) 蜂鸣器非阻塞，无 delay。
+     4) I2C 400kHz，整屏刷新约 25ms。
+     5) 通知闪烁按 250ms 定时刷新。
+     6) 双击窗口 300ms。
+     7) 全中文界面 + Telegram 中文 UTF-8 直显。
+
+   ★ 依赖库
+     U8g2 >= 2.35 / WiFiManager >= 2.0.17 / UniversalTelegramBot / ArduinoJson >= 6
+   ★ 分区表：Huge APP (3MB No OTA/1MB SPIFFS)
+     字库 208KB；紧张可换 u8g2_font_wqy12_t_gb2312a（111KB）
+   ============================================================================ */
+
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <WiFi.h>
@@ -5,810 +28,865 @@
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WiFiManager.h>
 
-#define BOT_TOKEN "BOT_TOKEN_HERE"
+/* ---------------------------------------------------------------------------
+   引脚定义
+   --------------------------------------------------------------------------- */
+#define ENC_A        18
+#define ENC_B        19
+#define ENC_BTN       5
+#define BTN_BACK      2
+#define BTN_CONFIRM   4
+#define BUZZER       23
 
-// ===== KİŞİ CHAT ID'LERİ =====
-#define CHAT_ID_ANNEM "CHAT_ID1_HERE"
-#define CHAT_ID_BABAM "CHAT_ID2_HERE"
-#define CHAT_ID_ABLAM "CHAT_ID3_HERE"
-#define CHAT_ID_GRUP "-GRUP_CHAT_ID_HERE"
-// ==============================
+/* ---------------------------------------------------------------------------
+   基本参数
+   --------------------------------------------------------------------------- */
+#define FONT_CN          u8g2_font_wqy12_t_gb2312
+#define AP_ADI           "E32TLG-Setup"
+#define KISI_SAYISI      4
 
-#define ENC_A     18
-#define ENC_B     19
-#define ENC_BTN   5
-#define BTN_BACK  2
-#define BTN_CONFIRM 4
-#define BUZZER    23
+#define TELEGRAM_ARALIK  2000      // 轮询间隔（后台任务，不影响界面）
+#define CIFT_TIK_ARALIK  300       // 双击判定窗口
+#define UZUN_BAS_SURE    2000      // 确认键长按
+#define GERI_UZUN_SURE   3000      // 返回键长按
+#define TUS_DEBOUNCE     15        // 按键去抖
+#define BILDIRIM_SURE    2000      // 新消息提示时长
+#define KAYMA_ARALIK     300       // 长文本滚动间隔
+#define TUSBAS_TEKRAR    60        // 编码器键防连击
 
 WiFiClientSecure client;
-UniversalTelegramBot bot(BOT_TOKEN, client);
+UniversalTelegramBot *bot = nullptr;
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 Preferences preferences;
+WiFiManager wm;
 
-const char* kisiler[] = {"Annem", "Babam", "Ablam", "Aile Grubu"};
-const char* chatIDler[] = {CHAT_ID_ANNEM, CHAT_ID_BABAM, CHAT_ID_ABLAM, CHAT_ID_GRUP};
-int kisiSayisi = 4;
+/* ---------------------------------------------------------------------------
+   机器人参数（NVS 命名空间 e32tlg）
+   --------------------------------------------------------------------------- */
+String botToken = "";
+String chatIDleri[KISI_SAYISI]   = {"", "", "", ""};
+String kisiIsimleri[KISI_SAYISI] = {"妈妈", "爸爸", "姐姐", "家庭群"};
+
+WiFiManagerParameter *pToken = nullptr;
+WiFiManagerParameter *pChat[KISI_SAYISI];
+WiFiManagerParameter *pIsim[KISI_SAYISI];
+
+const char *PARAM_ID_CHAT[KISI_SAYISI]  = {"c1", "c2", "c3", "c4"};
+const char *PARAM_ID_ISIM[KISI_SAYISI]  = {"n1", "n2", "n3", "n4"};
+const char *PARAM_LBL_CHAT[KISI_SAYISI] = {
+  "联系人1 Chat ID", "联系人2 Chat ID", "联系人3 Chat ID", "家庭群 Chat ID"
+};
+const char *PARAM_LBL_ISIM[KISI_SAYISI] = {
+  "联系人1 名称", "联系人2 名称", "联系人3 名称", "家庭群 名称"
+};
+
+/* ---------------------------------------------------------------------------
+   输入字符 / 快捷消息
+   --------------------------------------------------------------------------- */
+const char *harfler[] = {
+  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+  "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
+  "u", "v", "w", "x", "y", "z",
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  " ", ".", "-", "!", "?"
+};
+int harfSayisi = sizeof(harfler) / sizeof(harfler[0]);
+
+const char *hazirMesajlar[] = {
+  "好", "可以", "不行", "我出门了马上到",
+  "你在哪里", "我在等你", "等一下马上来"
+};
+int hazirMesajSayisi = sizeof(hazirMesajlar) / sizeof(hazirMesajlar[0]);
+
+/* ---------------------------------------------------------------------------
+   运行状态
+   --------------------------------------------------------------------------- */
 int seciliKisi = 0;
 String aktifChatID = "";
 bool kisiSecildi = false;
 
-String kayitliSSIDler[3] = {"", "", ""};
-String kayitliSifreler[3] = {"", "", ""};
-int kayitliAgSayisi = 0;
-
-const char* harfler[] = {
-  "a","b","c","d","e","f","g","h","i","j",
-  "k","l","m","n","o","p","r","s","t","u",
-  "v","y","z"," ",
-  "0","1","2","3","4","5","6","7","8","9",
-  ".","," ,"!","?","-","+"
-};
-int harfSayisi = 40;
-
-const char* sifreHarfleri[] = {
-  "a","b","c","d","e","f","g","h","i","j",
-  "k","l","m","n","o","p","q","r","s","t",
-  "u","v","w","x","y","z",
-  "A","B","C","D","E","F","G","H","I","J",
-  "K","L","M","N","O","P","Q","R","S","T",
-  "U","V","W","X","Y","Z",
-  "0","1","2","3","4","5","6","7","8","9",
-  ".","," ,"!","?","-","+","@","_","#","*"
-};
-int sifreHarfSayisi = 73;
-
-const char* hazirMesajlar[] = {
-  "Evet.",
-  "Tamam.",
-  "Hayir.",
-  "Ciktim, geliyorum.",
-  "Nerdesin?",
-  "Bekliyorum.",
-  "Bekle, geliyorum."
-};
-int hazirMesajSayisi = 7;
-int hazirMesajIndex = 0;
-
-int wifiMod = 0;
-int agSayisi = 0;
-int seciliAg = 0;
-String seciliSSID = "";
-String wifiSifre = "";
-bool wifiAyarTamam = false;
-
-int mod = 0;
+int mod = 0;              // 0 = 编写消息，1 = 快捷消息
 int harfIndex = 0;
-int sifreHarfIndex = 0;
 String mesaj = "";
 
 volatile int enkoderDegisim = 0;
 volatile int encA_son = HIGH;
 
-void IRAM_ATTR enkoderISR() {
-  int a = digitalRead(ENC_A);
-  int b = digitalRead(ENC_B);
-  if(encA_son == HIGH && a == LOW) {
-    if(b == HIGH) enkoderDegisim++;
-    else enkoderDegisim--;
-  }
-  encA_son = a;
-}
+String mesajGecmisi[KISI_SAYISI][4];
+String mesajTipleri[KISI_SAYISI][4];
 
-unsigned long sonTelegramKontrol = 0;
-#define TELEGRAM_ARALIK 3000
-
-String mesajGecmisi[4][4] = {
-  {"","","",""},
-  {"","","",""},
-  {"","","",""},
-  {"","","",""}
-};
-String mesajTipleri[4][4] = {
-  {"","","",""},
-  {"","","",""},
-  {"","","",""},
-  {"","","",""}
-};
-
-bool telegramBagli = false;
-unsigned long sonBasariliIstek = 0;
-
-unsigned long sonConfirmZamani = 0;
-#define CIFT_TIK_ARALIK 400
-#define UZUN_BAS_SURE 2000
+volatile bool telegramBagli = false;
+volatile unsigned long sonBasariliIstek = 0;
 
 int kaymaOffset0 = 0;
 int kaymaOffset1 = 0;
 unsigned long sonKaymaZamani = 0;
-#define KAYMA_ARALIK 300
-#define EKRAN_KARAKTER 18
+unsigned long sonCizim = 0;
 
-int agKaymaOffset = 0;
-unsigned long sonAgKaymaZamani = 0;
+int hazirMesajIndex = 0;
 
-bool bildirimVar = false;
-unsigned long bildirimZamani = 0;
-#define BILDIRIM_SURE 2000
+volatile bool bildirimVar = false;
+volatile unsigned long bildirimZamani = 0;
 
-// ===== WiFi HAFIZA =====
+unsigned long sonEncAksiyon = 0;
+unsigned long sonConfirmZamani = 0;
 
-void kayitliAglariYukle() {
-  kayitliAgSayisi = preferences.getInt("agSayisi", 0);
-  for(int i = 0; i < kayitliAgSayisi; i++) {
-    kayitliSSIDler[i] = preferences.getString(("ssid" + String(i)).c_str(), "");
-    kayitliSifreler[i] = preferences.getString(("sifre" + String(i)).c_str(), "");
+/* ---------------------------------------------------------------------------
+   线程间队列（UI <-> Telegram 任务）
+   --------------------------------------------------------------------------- */
+struct IsPaketi {
+  int    kisi;
+  String metin;
+};
+
+QueueHandle_t kuyrukGelen = nullptr;    // 后台收到的消息
+QueueHandle_t kuyrukGiden = nullptr;    // 待发送的消息
+
+volatile bool tgYeniden = false;        // 请求后台任务重建 bot
+volatile bool tgHazir   = false;        // bot 是否可用
+volatile bool gonderimBitti = false;
+volatile bool gonderimBasarili = false;
+
+/* =========================================================================
+   一、机器人参数存取
+   ========================================================================= */
+void ayarlariYukle() {
+  botToken = preferences.getString("token", "");
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    chatIDleri[i]   = preferences.getString(PARAM_ID_CHAT[i], "");
+    kisiIsimleri[i] = preferences.getString(PARAM_ID_ISIM[i], kisiIsimleri[i]);
+    if (kisiIsimleri[i].length() == 0) kisiIsimleri[i] = "联系人" + String(i + 1);
   }
 }
 
-void wifiKaydet(String ssid, String sifre) {
-  for(int i = 0; i < kayitliAgSayisi; i++) {
-    if(kayitliSSIDler[i] == ssid) {
-      kayitliSifreler[i] = sifre;
-      preferences.putString(("sifre" + String(i)).c_str(), sifre);
-      return;
-    }
+void kaydetParametreler() {
+  if (pToken != nullptr) botToken = String(pToken->getValue());
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    if (pChat[i] != nullptr) chatIDleri[i]   = String(pChat[i]->getValue());
+    if (pIsim[i] != nullptr) kisiIsimleri[i] = String(pIsim[i]->getValue());
   }
-  if(kayitliAgSayisi < 3) {
-    kayitliSSIDler[kayitliAgSayisi] = ssid;
-    kayitliSifreler[kayitliAgSayisi] = sifre;
-    kayitliAgSayisi++;
-  } else {
-    for(int i = 0; i < 2; i++) {
-      kayitliSSIDler[i] = kayitliSSIDler[i+1];
-      kayitliSifreler[i] = kayitliSifreler[i+1];
-    }
-    kayitliSSIDler[2] = ssid;
-    kayitliSifreler[2] = sifre;
+  botToken.trim();
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    chatIDleri[i].trim();
+    kisiIsimleri[i].trim();
+    if (kisiIsimleri[i].length() == 0) kisiIsimleri[i] = "联系人" + String(i + 1);
   }
-  preferences.putInt("agSayisi", kayitliAgSayisi);
-  for(int i = 0; i < kayitliAgSayisi; i++) {
-    preferences.putString(("ssid" + String(i)).c_str(), kayitliSSIDler[i]);
-    preferences.putString(("sifre" + String(i)).c_str(), kayitliSifreler[i]);
+  preferences.putString("token", botToken);
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    preferences.putString(PARAM_ID_CHAT[i], chatIDleri[i]);
+    preferences.putString(PARAM_ID_ISIM[i], kisiIsimleri[i]);
   }
 }
 
-String kayitliSifreBul(String ssid) {
-  for(int i = 0; i < kayitliAgSayisi; i++) {
-    if(kayitliSSIDler[i] == ssid) return kayitliSifreler[i];
-  }
-  return "";
+/* 请求后台任务重建 bot（最多等 3 秒） */
+void botOlustur() {
+  tgHazir = false;
+  tgYeniden = true;
+  unsigned long t0 = millis();
+  while (!tgHazir && millis() - t0 < 3000) delay(20);
 }
 
-// ===== SES =====
-
-void gonderilenSes() {
-  tone(BUZZER, 1000, 100);
-  delay(150);
-  tone(BUZZER, 1500, 100);
-}
-
-void gelenSes() {
-  tone(BUZZER, 800, 100);
-  delay(150);
-  tone(BUZZER, 800, 100);
-  delay(150);
-  tone(BUZZER, 1200, 150);
-}
-
-// ===== YARDIMCI =====
-
-// chat_id ve from_id ile kişi indeksini bul
+/* =========================================================================
+   二、Telegram 后台任务（运行在 core 0）
+   ========================================================================= */
 int chatIDdenKisiIndex(String chatID, String fromID) {
-  // Direkt eşleşme — özel mesaj
-  for(int i = 0; i < kisiSayisi; i++) {
-    if(chatID == chatIDler[i]) return i;
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    if (chatIDleri[i].length() > 0 && chatID == chatIDleri[i]) return i;
   }
-  // Grup mesajı — chat_id grup ID'si, from_id gönderen kişi
-  if(chatID == CHAT_ID_GRUP) return 3; // Aile Grubu index
-  // from_id ile eşleşen kişi grup üyesi mi?
-  for(int i = 0; i < kisiSayisi - 1; i++) {
-    if(fromID == chatIDler[i]) return 3; // Aile Grubu index
+  if (chatIDleri[3].length() > 0 && chatID == chatIDleri[3]) return 3;
+  for (int i = 0; i < 3; i++) {
+    if (chatIDleri[i].length() > 0 && fromID == chatIDleri[i]) return 3;
   }
   return -1;
 }
 
-bool aktifKisidanMi(int kisiIndex) {
-  return kisiIndex == seciliKisi;
-}
+void tgGorevi(void *param) {
+  unsigned long sonPoll = 0;
 
-String turkceLatine(String m) {
-  String sonuc = "";
-  int i = 0;
-  while(i < (int)m.length()) {
-    unsigned char c = m[i];
-    if(c == 0xC4) {
-      unsigned char c2 = m[i+1];
-      if(c2 == 0x9F || c2 == 0x9E) sonuc += "g";
-      else if(c2 == 0xB1) sonuc += "i";
-      else if(c2 == 0xB0) sonuc += "I";
-      else sonuc += "?";
-      i += 2;
-    } else if(c == 0xC5) {
-      unsigned char c2 = m[i+1];
-      if(c2 == 0x9F || c2 == 0x9E) sonuc += "s";
-      else sonuc += "?";
-      i += 2;
-    } else if(c == 0xC3) {
-      unsigned char c2 = m[i+1];
-      if(c2 == 0xB6 || c2 == 0x96) sonuc += "o";
-      else if(c2 == 0xBC || c2 == 0x9C) sonuc += "u";
-      else if(c2 == 0xA7 || c2 == 0x87) sonuc += "c";
-      else sonuc += "?";
-      i += 2;
-    } else {
-      sonuc += (char)c;
-      i++;
+  for (;;) {
+    /* ---- 重建 bot ---- */
+    if (tgYeniden) {
+      tgYeniden = false;
+      tgHazir   = false;
+      if (bot != nullptr) { delete bot; bot = nullptr; }
+      telegramBagli = false;
+      if (botToken.length() >= 20) {
+        client.setInsecure();
+        bot = new UniversalTelegramBot(botToken, client);
+        telegramBagli = true;
+        sonBasariliIstek = millis();
+      }
+      tgHazir = true;
+      sonPoll = millis();
     }
+
+    if (!tgHazir || bot == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    /* ---- 先把待发消息发完 ---- */
+    IsPaketi *s = nullptr;
+    if (xQueueReceive(kuyrukGiden, &s, 0) == pdTRUE) {
+      bool ok = false;
+      if (chatIDleri[s->kisi].length() > 0)
+        ok = bot->sendMessage(chatIDleri[s->kisi], s->metin, "");
+      if (ok) {
+        telegramBagli = true;
+        sonBasariliIstek = millis();
+      }
+      gonderimBasarili = ok;
+      gonderimBitti = true;
+      delete s;
+      continue;
+    }
+
+    /* ---- 轮询 ---- */
+    if (WiFi.status() == WL_CONNECTED && millis() - sonPoll >= TELEGRAM_ARALIK) {
+      sonPoll = millis();
+      int ms = bot->getUpdates(bot->last_message_received + 1);
+      if (ms > 0) {
+        for (int i = 0; i < ms; i++) {
+          int idx = chatIDdenKisiIndex(bot->messages[i].chat_id,
+                                       bot->messages[i].from_id);
+          if (idx < 0) continue;
+          if (bot->messages[i].text.length() == 0) continue;
+
+          IsPaketi *g = new IsPaketi();
+          g->kisi  = idx;
+          g->metin = bot->messages[i].text;
+          if (xQueueSend(kuyrukGelen, &g, 0) != pdTRUE) delete g;
+        }
+        telegramBagli = true;
+        sonBasariliIstek = millis();
+      }
+      if (millis() - sonBasariliIstek > 15000) telegramBagli = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
-  return sonuc;
 }
 
-void mesajEkle(String mesajMetni, String tip, int kisiIndex) {
-  if(kisiIndex < 0 || kisiIndex >= kisiSayisi) return;
-  if(tip == "o") mesajMetni = turkceLatine(mesajMetni);
-  for(int i = 3; i > 0; i--) {
-    mesajGecmisi[kisiIndex][i] = mesajGecmisi[kisiIndex][i-1];
-    mesajTipleri[kisiIndex][i] = mesajTipleri[kisiIndex][i-1];
+/* =========================================================================
+   三、显示辅助
+   ========================================================================= */
+int metinGenisligi(const String &s) {
+  return u8g2.getUTF8Width(s.c_str());
+}
+
+/* 超宽文字横向滚动 */
+void kayanYaz(int y, const String &s, int ofs) {
+  if (s.length() == 0) return;
+  int w = metinGenisligi(s);
+  if (w <= 126) {
+    u8g2.drawUTF8(0, y, s.c_str());
+    return;
   }
-  mesajGecmisi[kisiIndex][0] = mesajMetni;
-  mesajTipleri[kisiIndex][0] = tip;
-  if(kisiIndex == seciliKisi) {
-    kaymaOffset0 = 0;
-    kaymaOffset1 = 0;
-  }
+  String tekrar = s + "     ";
+  int wt = metinGenisligi(tekrar);
+  int y0 = (y - 11 < 0) ? 0 : (y - 11);
+  u8g2.setClipWindow(0, y0, 128, y + 2);
+  u8g2.drawUTF8(-ofs, y, tekrar.c_str());
+  u8g2.drawUTF8(-ofs + wt, y, tekrar.c_str());
+  u8g2.setMaxClipWindow();
 }
 
-String kaydirilmisMesaj(String m, int offset) {
-  String tam = m + "   ";
-  if((int)tam.length() <= EKRAN_KARAKTER) return tam;
-  if(offset >= (int)tam.length()) offset = 0;
-  String parcali = tam.substring(offset);
-  if((int)parcali.length() < EKRAN_KARAKTER)
-    parcali += tam.substring(0, EKRAN_KARAKTER - parcali.length());
-  return parcali.substring(0, EKRAN_KARAKTER);
+/* 输入行：超宽时右对齐 */
+void girisYaz(int y, const String &s) {
+  int w = metinGenisligi(s);
+  int x = (w <= 126) ? 0 : (126 - w + 2);
+  u8g2.setClipWindow(0, y - 11, 128, 64);
+  u8g2.drawUTF8(x, y, s.c_str());
+  u8g2.setMaxClipWindow();
 }
 
-String kaydirilmisAg(String m, int offset) {
-  String tam = m + "   ";
-  if((int)tam.length() <= 18) return tam;
-  if(offset >= (int)tam.length()) offset = 0;
-  String parcali = tam.substring(offset);
-  if((int)parcali.length() < 18)
-    parcali += tam.substring(0, 18 - parcali.length());
-  return parcali.substring(0, 18);
+void ekranMesaj(const String &satir1, const String &satir2) {
+  u8g2.clearBuffer();
+  u8g2.setFont(FONT_CN);
+  u8g2.drawUTF8(0, 11, "E32TLG");
+  u8g2.drawLine(0, 14, 127, 14);
+  if (satir1.length()) kayanYaz(30, satir1, 0);
+  if (satir2.length()) kayanYaz(46, satir2, 0);
+  u8g2.sendBuffer();
+  sonCizim = millis();
 }
 
-// ===== İKONLAR =====
-
+/* =========================================================================
+   四、状态图标
+   ========================================================================= */
 void wifiIkonu(int x, bool bagli) {
   int yukseklikler[] = {3, 5, 7, 9};
   int rssi = WiFi.RSSI();
   int doluCubuk = 0;
-  if(bagli) {
-    if(rssi >= -55) doluCubuk = 4;
-    else if(rssi >= -65) doluCubuk = 3;
-    else if(rssi >= -75) doluCubuk = 2;
-    else doluCubuk = 1;
+  if (bagli) {
+    if      (rssi >= -55) doluCubuk = 4;
+    else if (rssi >= -65) doluCubuk = 3;
+    else if (rssi >= -75) doluCubuk = 2;
+    else                  doluCubuk = 1;
   }
-  for(int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++) {
     int cx = x + i * 4;
     int cy = 11;
-    int h = yukseklikler[i];
-    if(i < doluCubuk) u8g2.drawBox(cx, cy - h, 3, h);
-    else u8g2.drawFrame(cx, cy - h, 3, h);
+    int h  = yukseklikler[i];
+    if (i < doluCubuk) u8g2.drawBox(cx, cy - h, 3, h);
+    else               u8g2.drawFrame(cx, cy - h, 3, h);
   }
-  if(!bagli) u8g2.drawStr(x + 18, 10, "!");
+  if (!bagli) u8g2.drawStr(x + 18, 10, "!");
 }
 
 void telegramIkonu(int x, bool bagli) {
-  if(bagli) {
-    u8g2.drawLine(x, 6, x+3, 10);
-    u8g2.drawLine(x+1, 6, x+4, 10);
-    u8g2.drawLine(x+3, 10, x+9, 2);
-    u8g2.drawLine(x+4, 10, x+10, 2);
+  if (bagli) {
+    u8g2.drawLine(x,     6, x + 3, 10);
+    u8g2.drawLine(x + 1, 6, x + 4, 10);
+    u8g2.drawLine(x + 3, 10, x + 9, 2);
+    u8g2.drawLine(x + 4, 10, x + 10, 2);
   } else {
-    u8g2.drawLine(x, 2, x+9, 11);
-    u8g2.drawLine(x+1, 2, x+10, 11);
-    u8g2.drawLine(x+9, 2, x, 11);
-    u8g2.drawLine(x+10, 2, x+1, 11);
+    u8g2.drawLine(x,     2, x + 9, 11);
+    u8g2.drawLine(x + 1, 2, x + 10, 11);
+    u8g2.drawLine(x + 9, 2, x, 11);
+    u8g2.drawLine(x + 10, 2, x + 1, 11);
   }
 }
 
 void mektupIkonu(int x) {
   u8g2.drawFrame(x, 3, 12, 8);
-  u8g2.drawLine(x, 3, x+6, 8);
-  u8g2.drawLine(x+12, 3, x+6, 8);
+  u8g2.drawLine(x, 3, x + 6, 8);
+  u8g2.drawLine(x + 12, 3, x + 6, 8);
 }
 
-// ===== EKRANLAR =====
-
+/* =========================================================================
+   五、界面
+   ========================================================================= */
 void kisiSecimEkrani() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "E32TLG");
-  u8g2.drawLine(0, 13, 128, 13);
-  u8g2.drawStr(0, 25, "Kime yazacaksin?");
-  u8g2.drawLine(0, 27, 128, 27);
-  if(seciliKisi > 0)
-    u8g2.drawStr(0, 38, kisiler[seciliKisi - 1]);
-  u8g2.drawBox(0, 40, 128, 12);
-  u8g2.setDrawColor(0);
-  String seciliIsim = String(kisiler[seciliKisi]);
-  if(seciliKisi == 3) seciliIsim = "* " + seciliIsim;
-  u8g2.drawStr(2, 50, seciliIsim.c_str());
+  u8g2.setFont(FONT_CN);
   u8g2.setDrawColor(1);
-  if(seciliKisi < kisiSayisi - 1)
-    u8g2.drawStr(0, 62, kisiler[seciliKisi + 1]);
-  u8g2.sendBuffer();
-}
+  u8g2.drawUTF8(0, 11, "E32TLG");
+  u8g2.drawLine(0, 14, 127, 14);
+  u8g2.drawUTF8(0, 26, "发送给谁");
 
-void agTaraEkrani() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "E32TLG");
-  u8g2.drawLine(0, 13, 128, 13);
-  u8g2.drawStr(0, 35, "WiFi taranıyor...");
-  u8g2.sendBuffer();
-}
+  if (seciliKisi > 0)
+    u8g2.drawUTF8(3, 39, kisiIsimleri[seciliKisi - 1].c_str());
 
-void agSecimEkrani() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "WiFi Sec:");
-  u8g2.drawLine(0, 13, 128, 13);
-  if(seciliAg > 0) {
-    String onceki = WiFi.SSID(seciliAg-1).substring(0,18);
-    if(kayitliSifreBul(WiFi.SSID(seciliAg-1)) != "") onceki += "*";
-    u8g2.drawStr(0, 25, onceki.c_str());
-  }
-  u8g2.drawBox(0, 27, 128, 12);
+  u8g2.drawBox(0, 41, 128, 13);
   u8g2.setDrawColor(0);
-  String seciliAdi = kaydirilmisAg(WiFi.SSID(seciliAg), agKaymaOffset);
-  if(kayitliSifreBul(WiFi.SSID(seciliAg)) != "") seciliAdi += "*";
-  u8g2.drawStr(2, 37, seciliAdi.c_str());
+  String seciliAd = kisiIsimleri[seciliKisi];
+  if (seciliKisi == 3) seciliAd = "* " + seciliAd;
+  u8g2.drawUTF8(3, 51, seciliAd.c_str());
   u8g2.setDrawColor(1);
-  if(seciliAg < agSayisi-1) {
-    String sonraki = WiFi.SSID(seciliAg+1).substring(0,18);
-    if(kayitliSifreBul(WiFi.SSID(seciliAg+1)) != "") sonraki += "*";
-    u8g2.drawStr(0, 52, sonraki.c_str());
-  }
-  if(kayitliSifreBul(WiFi.SSID(seciliAg)) != "") {
-    u8g2.drawStr(0, 63, "PSH:baglan *=kayitli");
-  } else {
-    u8g2.drawStr(0, 63, "PSH:sec BACK:tara");
-  }
+
+  if (seciliKisi < KISI_SAYISI - 1)
+    u8g2.drawUTF8(3, 63, kisiIsimleri[seciliKisi + 1].c_str());
+
   u8g2.sendBuffer();
+  sonCizim = millis();
 }
 
-void sifreGirEkrani() {
+void apCallback(WiFiManager *m) {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, seciliSSID.substring(0,18).c_str());
-  u8g2.drawLine(0, 13, 128, 13);
-  u8g2.drawStr(0, 25, "Sifre:");
-  String sg = wifiSifre + String(sifreHarfleri[sifreHarfIndex]);
-  if(sg.length() > 18) sg = sg.substring(sg.length()-18);
-  u8g2.drawStr(0, 40, sg.c_str());
-  u8g2.drawLine(0, 50, 128, 50);
-  u8g2.drawStr(0, 62, "PSH:ekle CON:baglan");
+  u8g2.setFont(FONT_CN);
+  u8g2.drawUTF8(0, 11, "配置模式");
+  u8g2.drawLine(0, 14, 127, 14);
+  u8g2.drawUTF8(0, 28, "热点 " AP_ADI);
+  u8g2.drawUTF8(0, 44, "打开 192.168.4.1");
+  u8g2.drawUTF8(0, 58, "配置WiFi和机器人");
   u8g2.sendBuffer();
+  sonCizim = millis();
 }
 
-void baglaniyorEkrani(String ssid) {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "E32TLG");
-  u8g2.drawLine(0, 13, 128, 13);
-  u8g2.drawStr(0, 30, "Baglanıyor...");
-  u8g2.drawStr(0, 45, ssid.substring(0,20).c_str());
-  u8g2.sendBuffer();
+String mesajSatiri(int idx) {
+  String t = mesajGecmisi[seciliKisi][idx];
+  if (t.length() == 0) return "";
+  String p = (mesajTipleri[seciliKisi][idx] == "ben") ? "我> " : "对< ";
+  return p + t;
 }
 
 void ekraniGuncelle() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  String baslik = ">" + String(kisiler[seciliKisi]);
-  u8g2.drawStr(0, 10, baslik.c_str());
+  u8g2.setFont(FONT_CN);
+  u8g2.setDrawColor(1);
 
-  if(bildirimVar && millis()-bildirimZamani < BILDIRIM_SURE) {
-    if((millis()-bildirimZamani) % 400 < 200) {
-      mektupIkonu(114);
-    }
+  String baslik = "> " + kisiIsimleri[seciliKisi];
+  u8g2.drawUTF8(0, 11, baslik.c_str());
+
+  if (bildirimVar && millis() - bildirimZamani < BILDIRIM_SURE) {
+    if ((millis() - bildirimZamani) % 400 < 200) mektupIkonu(114);
   } else {
-    bildirimVar = false;
-    wifiIkonu(90, WiFi.status() == WL_CONNECTED);
-    if(WiFi.status() == WL_CONNECTED) telegramIkonu(114, telegramBagli);
+    wifiIkonu(88, WiFi.status() == WL_CONNECTED);
+    if (WiFi.status() == WL_CONNECTED) telegramIkonu(112, telegramBagli);
   }
+  u8g2.drawLine(0, 14, 127, 14);
 
-  u8g2.drawLine(0, 13, 128, 13);
-
-  if(mod == 0) {
-    if(mesajGecmisi[seciliKisi][1] != "") {
-      String s1 = (mesajTipleri[seciliKisi][1]=="ben") ? ">>" : "<<";
-      u8g2.drawStr(0, 27, (s1+kaydirilmisMesaj(mesajGecmisi[seciliKisi][1],kaymaOffset1)).c_str());
-    }
-    if(mesajGecmisi[seciliKisi][0] != "") {
-      String s0 = (mesajTipleri[seciliKisi][0]=="ben") ? ">>" : "<<";
-      u8g2.drawStr(0, 40, (s0+kaydirilmisMesaj(mesajGecmisi[seciliKisi][0],kaymaOffset0)).c_str());
-    }
-    u8g2.drawLine(0, 50, 128, 50);
-    u8g2.drawStr(0, 62, (">"+mesaj+String(harfler[harfIndex])).c_str());
+  if (mod == 0) {
+    String s1 = mesajSatiri(1);
+    if (s1.length()) kayanYaz(26, s1, kaymaOffset1);
+    String s0 = mesajSatiri(0);
+    if (s0.length()) kayanYaz(39, s0, kaymaOffset0);
+    u8g2.drawLine(0, 50, 127, 50);
+    girisYaz(62, ">" + mesaj + String(harfler[harfIndex]));
   } else {
-    u8g2.drawStr(0, 25, "Hazir mesaj:");
-    u8g2.drawLine(0, 27, 128, 27);
-    if(hazirMesajIndex > 0)
-      u8g2.drawStr(0, 38, String(hazirMesajlar[hazirMesajIndex-1]).substring(0,22).c_str());
-    u8g2.drawBox(0, 40, 128, 12);
+    u8g2.drawUTF8(0, 26, "快捷消息");
+    u8g2.drawLine(0, 29, 127, 29);
+
+    if (hazirMesajIndex > 0)
+      kayanYaz(39, String(hazirMesajlar[hazirMesajIndex - 1]), 0);
+
+    u8g2.drawBox(0, 41, 128, 13);
     u8g2.setDrawColor(0);
-    u8g2.drawStr(2, 50, String(hazirMesajlar[hazirMesajIndex]).substring(0,22).c_str());
+    u8g2.drawUTF8(3, 51, hazirMesajlar[hazirMesajIndex]);
     u8g2.setDrawColor(1);
-    if(hazirMesajIndex < hazirMesajSayisi-1)
-      u8g2.drawStr(0, 62, String(hazirMesajlar[hazirMesajIndex+1]).substring(0,22).c_str());
+
+    if (hazirMesajIndex < hazirMesajSayisi - 1)
+      kayanYaz(63, String(hazirMesajlar[hazirMesajIndex + 1]), 0);
   }
   u8g2.sendBuffer();
+  sonCizim = millis();
 }
 
-void mesajGonder(String m) {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 20, ("-> " + String(kisiler[seciliKisi])).c_str());
-  u8g2.drawStr(0, 40, "Gonderiliyor...");
-  u8g2.sendBuffer();
-  if(bot.sendMessage(aktifChatID, m, "")) {
-    mesajEkle(m, "ben", seciliKisi);
-    telegramBagli = true;
-    sonBasariliIstek = millis();
-    gonderilenSes();
-  }
+/* =========================================================================
+   六、非阻塞蜂鸣器
+   ========================================================================= */
+int bipTip = 0;                 // 0=空闲 1=收到 2=发出
+uint8_t bipAdim = 0;
+unsigned long bipSonraki = 0;
+
+void bipBaslat(uint8_t tip) {
+  bipTip = tip;
+  bipAdim = 1;
+  if (tip == 1)      tone(BUZZER, 800, 90);
+  else if (tip == 2) tone(BUZZER, 1000, 90);
+  bipSonraki = millis() + 200;
 }
 
-bool wifiBaglan(String ssid, String sifre) {
-  baglaniyorEkrani(ssid);
-  WiFi.begin(ssid.c_str(), sifre.c_str());
-  int d = 0;
-  while(WiFi.status() != WL_CONNECTED && d < 20) { delay(500); d++; }
-  return WiFi.status() == WL_CONNECTED;
-}
+void bipDongu() {
+  if (bipAdim == 0) return;
+  if ((long)(millis() - bipSonraki) < 0) return;
 
-void wifiSecimineGit() {
-  wifiAyarTamam = false;
-  kisiSecildi = false;
-  WiFi.disconnect();
-  agTaraEkrani();
-  agSayisi = WiFi.scanNetworks();
-  seciliAg = 0;
-  agKaymaOffset = 0;
-  wifiMod = 0;
-  enkoderDegisim = 0;
-  agSecimEkrani();
-}
-
-// ===== SETUP =====
-
-void setup() {
-  Wire.begin(21, 22);
-  u8g2.begin();
-  pinMode(ENC_A, INPUT_PULLUP);
-  pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(ENC_BTN, INPUT_PULLUP);
-  pinMode(BTN_BACK, INPUT_PULLUP);
-  pinMode(BTN_CONFIRM, INPUT_PULLUP);
-  pinMode(BUZZER, OUTPUT);
-
-  attachInterrupt(digitalPinToInterrupt(ENC_A), enkoderISR, CHANGE);
-
-  preferences.begin("e32tlg", false);
-  kayitliAglariYukle();
-
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 10, "E32TLG");
-  u8g2.drawLine(0, 13, 128, 13);
-
-  if(kayitliAgSayisi > 0) {
-    String kSSID = kayitliSSIDler[kayitliAgSayisi-1];
-    String kSifre = kayitliSifreler[kayitliAgSayisi-1];
-    u8g2.drawStr(0, 30, "Kayitli WiFi:");
-    u8g2.drawStr(0, 45, kSSID.substring(0,20).c_str());
-    u8g2.sendBuffer();
-    delay(1000);
-    if(wifiBaglan(kSSID, kSifre)) {
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(0, 10, "E32TLG");
-      u8g2.drawLine(0, 13, 128, 13);
-      u8g2.drawStr(0, 35, "WiFi TAMAM!");
-      u8g2.sendBuffer();
-      delay(1000);
-      client.setInsecure();
-      telegramBagli = true;
-      sonBasariliIstek = millis();
-      wifiAyarTamam = true;
-      seciliKisi = 0;
-      kisiSecimEkrani();
-      return;
+  if (bipTip == 1) {
+    if (bipAdim == 1) {
+      tone(BUZZER, 800, 90);
+      bipAdim = 2;
+      bipSonraki = millis() + 200;
+    } else if (bipAdim == 2) {
+      tone(BUZZER, 1200, 140);
+      bipAdim = 0;
     } else {
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(0, 30, "Baglanamadı!");
-      u8g2.drawStr(0, 45, "Ag taranıyor...");
-      u8g2.sendBuffer();
-      delay(1500);
+      bipAdim = 0;
+    }
+  } else {
+    if (bipAdim == 1) {
+      tone(BUZZER, 1500, 90);
+      bipAdim = 0;
+    } else {
+      bipAdim = 0;
     }
   }
-
-  agTaraEkrani();
-  agSayisi = WiFi.scanNetworks();
-  seciliAg = 0;
-  wifiMod = 0;
-  agSecimEkrani();
 }
 
-// ===== LOOP =====
+/* =========================================================================
+   七、消息处理
+   ========================================================================= */
+bool aktifKisidanMi(int kisiIndex) {
+  return kisiIndex == seciliKisi;
+}
 
-void loop() {
+void mesajEkle(String mesajMetni, String tip, int kisiIndex) {
+  if (kisiIndex < 0 || kisiIndex >= KISI_SAYISI) return;
+  // Telegram 正文就是 UTF-8，直接 drawUTF8 显示中文
+  mesajMetni.replace("\r", " ");
+  mesajMetni.replace("\n", " ");
+  mesajMetni.replace("\t", " ");
+  if (mesajMetni.length() > 200) mesajMetni = mesajMetni.substring(0, 200);
 
-  // ===== WiFi SEÇİM MODU =====
-  if(!wifiAyarTamam) {
-    if(millis()-sonAgKaymaZamani > 300) {
-      sonAgKaymaZamani = millis();
-      if(wifiMod==0 && (int)WiFi.SSID(seciliAg).length()>18) {
-        agKaymaOffset++;
-        if(agKaymaOffset >= (int)(WiFi.SSID(seciliAg).length()+3)) agKaymaOffset=0;
-        agSecimEkrani();
-      }
-    }
+  for (int i = 3; i > 0; i--) {
+    mesajGecmisi[kisiIndex][i] = mesajGecmisi[kisiIndex][i - 1];
+    mesajTipleri[kisiIndex][i] = mesajTipleri[kisiIndex][i - 1];
+  }
+  mesajGecmisi[kisiIndex][0] = mesajMetni;
+  mesajTipleri[kisiIndex][0] = tip;
+  if (kisiIndex == seciliKisi) {
+    kaymaOffset0 = 0;
+    kaymaOffset1 = 0;
+  }
+}
 
-    if(enkoderDegisim != 0) {
-      if(wifiMod == 0) {
-        if(enkoderDegisim > 0) seciliAg = (seciliAg+1) % agSayisi;
-        else seciliAg = (seciliAg-1+agSayisi) % agSayisi;
-        agKaymaOffset = 0;
-        enkoderDegisim = 0;
-        agSecimEkrani();
-      } else {
-        if(enkoderDegisim > 0) {
-          sifreHarfIndex = (sifreHarfIndex+1) % sifreHarfSayisi;
-        } else {
-          sifreHarfIndex--;
-          if(sifreHarfIndex < 0) sifreHarfIndex = sifreHarfSayisi-1;
-        }
-        enkoderDegisim = 0;
-        sifreGirEkrani();
-      }
-    }
-
-    if(digitalRead(ENC_BTN)==LOW) {
-      delay(200);
-      if(wifiMod==0) {
-        seciliSSID = WiFi.SSID(seciliAg);
-        String kayitliSifre = kayitliSifreBul(seciliSSID);
-        if(kayitliSifre != "") {
-          if(wifiBaglan(seciliSSID, kayitliSifre)) {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            u8g2.drawStr(0, 10, "E32TLG");
-            u8g2.drawLine(0, 13, 128, 13);
-            u8g2.drawStr(0, 35, "WiFi TAMAM!");
-            u8g2.sendBuffer();
-            delay(1000);
-            client.setInsecure();
-            telegramBagli=true;
-            sonBasariliIstek=millis();
-            wifiAyarTamam=true;
-            seciliKisi=0;
-            kisiSecimEkrani();
-          } else {
-            wifiSifre=""; sifreHarfIndex=0;
-            wifiMod=1; sifreGirEkrani();
-          }
-        } else {
-          wifiSifre=""; sifreHarfIndex=0;
-          wifiMod=1; sifreGirEkrani();
-        }
-      } else {
-        wifiSifre += String(sifreHarfleri[sifreHarfIndex]);
-        sifreGirEkrani();
-      }
-    }
-
-    if(digitalRead(BTN_BACK)==LOW) {
-      delay(200);
-      if(wifiMod==1) {
-        if(wifiSifre.length()>0) {
-          wifiSifre = wifiSifre.substring(0, wifiSifre.length()-1);
-          sifreGirEkrani();
-        } else {
-          wifiMod=0; agKaymaOffset=0; agSecimEkrani();
-        }
-      } else {
-        agTaraEkrani();
-        agSayisi=WiFi.scanNetworks();
-        seciliAg=0; agKaymaOffset=0; agSecimEkrani();
-      }
-    }
-
-    if(digitalRead(BTN_CONFIRM)==LOW) {
-      delay(200);
-      if(wifiMod==1) {
-        wifiSifre += String(sifreHarfleri[sifreHarfIndex]);
-        if(wifiBaglan(seciliSSID, wifiSifre)) {
-          wifiKaydet(seciliSSID, wifiSifre);
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          u8g2.drawStr(0, 10, "E32TLG");
-          u8g2.drawLine(0, 13, 128, 13);
-          u8g2.drawStr(0, 35, "WiFi TAMAM!");
-          u8g2.sendBuffer();
-          delay(1000);
-          client.setInsecure();
-          telegramBagli=true;
-          sonBasariliIstek=millis();
-          wifiAyarTamam=true;
-          seciliKisi=0;
-          kisiSecimEkrani();
-        } else {
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          u8g2.drawStr(0, 30, "Baglanamadı!");
-          u8g2.drawStr(0, 45, "Sifre yanlis?");
-          u8g2.sendBuffer();
-          delay(2000);
-          wifiSifre = "";
-          sifreHarfIndex = 0;
-          sifreGirEkrani();
-        }
-      }
-    }
+/* 发送：写入队列立刻返回，界面不卡网络 */
+void mesajGonder(String m) {
+  if (m.length() == 0) return;
+  if (!tgHazir || botToken.length() < 20) {
+    ekranMesaj("机器人未就绪", "长按返回键重新配置");
+    delay(900);
+    ekraniGuncelle();
+    return;
+  }
+  if (aktifChatID.length() == 0) {
+    ekranMesaj("该联系人无 Chat ID", "长按返回键配置");
+    delay(900);
+    ekraniGuncelle();
     return;
   }
 
-  // ===== KİŞİ SEÇİM MODU =====
-  if(!kisiSecildi) {
-    if(enkoderDegisim != 0) {
-      if(enkoderDegisim>0) seciliKisi=(seciliKisi+1)%kisiSayisi;
-      else seciliKisi=(seciliKisi-1+kisiSayisi)%kisiSayisi;
-      enkoderDegisim=0;
+  mesajEkle(m, "ben", seciliKisi);      // 先上屏，立刻有反馈
+  IsPaketi *p = new IsPaketi();
+  p->kisi  = seciliKisi;
+  p->metin = m;
+  if (xQueueSend(kuyrukGiden, &p, 0) != pdTRUE) {
+    delete p;
+    ekranMesaj("发送失败", "队列已满稍后再试");
+    delay(900);
+  }
+  bipBaslat(2);
+  ekraniGuncelle();
+}
+
+/* 取队列：收到的消息 + 发送结果 */
+void kuyruguIsle() {
+  IsPaketi *g = nullptr;
+  bool yeniVar = false;
+
+  while (xQueueReceive(kuyrukGelen, &g, 0) == pdTRUE) {
+    if (g->metin.length() > 0) {
+      mesajEkle(g->metin, "o", g->kisi);
+      if (g->kisi != seciliKisi) {
+        bildirimVar = true;
+        bildirimZamani = millis();
+      }
+      yeniVar = true;
+    }
+    delete g;
+  }
+
+  if (yeniVar) {
+    bipBaslat(1);
+    if (kisiSecildi) ekraniGuncelle();
+  }
+
+  if (gonderimBitti) {
+    gonderimBitti = false;
+    if (!gonderimBasarili) {
+      ekranMesaj("发送失败", "请检查网络或 Chat ID");
+      delay(900);
+      ekraniGuncelle();
+    }
+  }
+}
+
+/* =========================================================================
+   八、编码器中断
+   ========================================================================= */
+void IRAM_ATTR enkoderISR() {
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+  if (encA_son == HIGH && a == LOW) {
+    if (b == HIGH) enkoderDegisim++;
+    else           enkoderDegisim--;
+  }
+  encA_son = a;
+}
+
+/* =========================================================================
+   九、非阻塞按键（数组 + int 索引，避免 Arduino 原型提前引用 struct）
+   ========================================================================= */
+#define TUS_ENC   0
+#define TUS_BACK  1
+#define TUS_CONF  2
+
+uint8_t       tusPin[3]       = {ENC_BTN, BTN_BACK, BTN_CONFIRM};
+bool          tusRaw[3]       = {false, false, false};   // 原始读数（true = 按下）
+unsigned long tusRawZaman[3]  = {0, 0, 0};
+bool          tusDurum[3]     = {false, false, false};   // 去抖后状态
+unsigned long tusBasZaman[3]  = {0, 0, 0};
+bool          tusUzun[3]      = {false, false, false};   // 长按已处理
+
+bool encOnceki  = false;
+bool backOnceki = false;
+bool confOnceki = false;
+
+void tusBaslat(int idx) {
+  bool raw = (digitalRead(tusPin[idx]) == LOW);
+  tusRaw[idx]      = raw;
+  tusRawZaman[idx] = millis();
+  tusDurum[idx]    = raw;
+  tusBasZaman[idx] = millis();
+  tusUzun[idx]     = false;
+}
+
+/* 15ms 去抖，返回去抖后的「是否按下」 */
+bool tusOku(int idx) {
+  bool raw = (digitalRead(tusPin[idx]) == LOW);
+  if (raw != tusRaw[idx]) {
+    tusRaw[idx] = raw;
+    tusRawZaman[idx] = millis();
+  }
+  if (tusDurum[idx] != tusRaw[idx] && millis() - tusRawZaman[idx] >= TUS_DEBOUNCE) {
+    tusDurum[idx] = tusRaw[idx];
+    if (tusDurum[idx]) {              // 刚按下：记起点，清长按标记
+      tusBasZaman[idx] = millis();
+      tusUzun[idx] = false;
+    }
+  }
+  return tusDurum[idx];
+}
+
+/* =========================================================================
+   十、WiFi + 参数配置
+   ========================================================================= */
+void portalBaslat() {
+  ekranMesaj("进入配置模式", "热点 " AP_ADI);
+  delay(200);
+
+  wm.setConfigPortalTimeout(300);
+  wm.startConfigPortal(AP_ADI);        // 阻塞，保存或超时后返回
+
+  ayarlariYukle();
+  Serial.println("[WiFi] 配置门户结束");
+}
+
+void wifiBaslat() {
+  ekranMesaj("正在连接网络", "请稍候");
+  delay(300);
+
+  wm.setDebugOutput(false);
+  wm.setConnectTimeout(20);
+  wm.setConfigPortalTimeout(300);
+  wm.setAPCallback(apCallback);
+  wm.setSaveParamsCallback(kaydetParametreler);
+  wm.setBreakAfterConfig(true);
+  wm.setTitle("E32TLG Setup");
+  wm.setCustomHeadElement("<meta charset=\"utf-8\">");
+
+  pToken = new WiFiManagerParameter("token", "机器人 Token (Bot Token)", botToken.c_str(), 100);
+  wm.addParameter(pToken);
+
+  for (int i = 0; i < KISI_SAYISI; i++) {
+    pChat[i] = new WiFiManagerParameter(PARAM_ID_CHAT[i], PARAM_LBL_CHAT[i],
+                                        chatIDleri[i].c_str(), 40);
+    pIsim[i] = new WiFiManagerParameter(PARAM_ID_ISIM[i], PARAM_LBL_ISIM[i],
+                                        kisiIsimleri[i].c_str(), 24);
+    wm.addParameter(pChat[i]);
+    wm.addParameter(pIsim[i]);
+  }
+
+  if (!wm.autoConnect(AP_ADI)) {
+    ekranMesaj("WiFi连接失败", "即将重启");
+    delay(3000);
+    ESP.restart();
+  }
+
+  kaydetParametreler();
+
+  String ip = WiFi.localIP().toString();
+  ekranMesaj("已连接 " + WiFi.SSID(), ip);
+  Serial.println("[WiFi] " + WiFi.SSID() + " -> " + ip);
+  delay(500);
+}
+
+/* =========================================================================
+   十一、setup
+   ========================================================================= */
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);          // 屏刷新提速；花屏就改 200000
+  u8g2.begin();
+  u8g2.setFont(FONT_CN);
+
+  pinMode(ENC_A,       INPUT_PULLUP);
+  pinMode(ENC_B,       INPUT_PULLUP);
+  pinMode(ENC_BTN,     INPUT_PULLUP);
+  pinMode(BTN_BACK,    INPUT_PULLUP);
+  pinMode(BTN_CONFIRM, INPUT_PULLUP);
+  pinMode(BUZZER,      OUTPUT);
+  tone(BUZZER, 1500, 60);
+  attachInterrupt(digitalPinToInterrupt(ENC_A), enkoderISR, CHANGE);
+
+  tusBaslat(TUS_ENC);
+  tusBaslat(TUS_BACK);
+  tusBaslat(TUS_CONF);
+
+  preferences.begin("e32tlg", false);
+  ayarlariYukle();
+
+  /* 队列 + 后台 Telegram 任务（core 0） */
+  kuyrukGelen = xQueueCreate(6, sizeof(IsPaketi *));
+  kuyrukGiden = xQueueCreate(4, sizeof(IsPaketi *));
+  xTaskCreatePinnedToCore(tgGorevi, "telegram", 12288, nullptr, 1, nullptr, 0);
+
+  ekranMesaj("正在启动", "读取参数");
+  delay(300);
+
+  wifiBaslat();
+
+  if (botToken.length() < 20) {
+    portalBaslat();
+    ayarlariYukle();
+  }
+
+  botOlustur();
+  if (botToken.length() < 20) {
+    ekranMesaj("未配置机器人", "长按返回键进入配置");
+    delay(1500);
+  }
+
+  seciliKisi   = 0;
+  kisiSecildi  = false;
+  enkoderDegisim = 0;
+  encOnceki = backOnceki = confOnceki = false;
+  kisiSecimEkrani();
+}
+
+/* =========================================================================
+   十二、loop（只做三件事：读键、取队列、画屏）
+   ========================================================================= */
+void loop() {
+  bool e = tusOku(TUS_ENC);
+  bool b = tusOku(TUS_BACK);
+  bool c = tusOku(TUS_CONF);
+
+  kuyruguIsle();
+  bipDongu();
+
+  /* ---------------- 选联系人 ---------------- */
+  if (!kisiSecildi) {
+    if (enkoderDegisim != 0) {
+      if (enkoderDegisim > 0) seciliKisi = (seciliKisi + 1) % KISI_SAYISI;
+      else                    seciliKisi = (seciliKisi - 1 + KISI_SAYISI) % KISI_SAYISI;
+      enkoderDegisim = 0;
       kisiSecimEkrani();
     }
-    if(digitalRead(ENC_BTN)==LOW || digitalRead(BTN_CONFIRM)==LOW) {
-      delay(200);
-      aktifChatID = chatIDler[seciliKisi];
+    if ((e && !encOnceki) || (c && !confOnceki)) {
+      aktifChatID = chatIDleri[seciliKisi];
       kisiSecildi = true;
       kaymaOffset0 = 0;
       kaymaOffset1 = 0;
       enkoderDegisim = 0;
+      if (aktifChatID.length() == 0) {
+        ekranMesaj("该联系人无 Chat ID", "长按返回键配置");
+        delay(800);
+      }
       ekraniGuncelle();
     }
+    encOnceki = e; backOnceki = b; confOnceki = c;
     return;
   }
 
-  // ===== NORMAL ÇALIŞMA MODU =====
+  /* ---------------- 编码器键：按下立即加字符 ---------------- */
+  if (e && !encOnceki && millis() - sonEncAksiyon > TUSBAS_TEKRAR) {
+    if (mod == 0) {
+      mesaj += String(harfler[harfIndex]);
+      ekraniGuncelle();
+    }
+    sonEncAksiyon = millis();
+  }
+  encOnceki = e;
 
-  if(enkoderDegisim != 0) {
-    if(mod==0) {
-      if(enkoderDegisim>0) harfIndex=(harfIndex+1)%harfSayisi;
-      else harfIndex=(harfIndex-1+harfSayisi)%harfSayisi;
+  /* ---------------- 旋转 ---------------- */
+  if (enkoderDegisim != 0) {
+    if (mod == 0) {
+      if (enkoderDegisim > 0) harfIndex = (harfIndex + 1) % harfSayisi;
+      else                    harfIndex = (harfIndex - 1 + harfSayisi) % harfSayisi;
     } else {
-      if(enkoderDegisim>0) hazirMesajIndex=(hazirMesajIndex+1)%hazirMesajSayisi;
-      else hazirMesajIndex=(hazirMesajIndex-1+hazirMesajSayisi)%hazirMesajSayisi;
+      if (enkoderDegisim > 0) hazirMesajIndex = (hazirMesajIndex + 1) % hazirMesajSayisi;
+      else                    hazirMesajIndex = (hazirMesajIndex - 1 + hazirMesajSayisi) % hazirMesajSayisi;
     }
-    enkoderDegisim=0;
+    enkoderDegisim = 0;
     ekraniGuncelle();
   }
 
-  if(bildirimVar && millis()-bildirimZamani >= BILDIRIM_SURE) {
-    bildirimVar = false;
+  /* ---------------- 返回键 ---------------- */
+  if (b && !tusUzun[TUS_BACK] && millis() - tusBasZaman[TUS_BACK] >= GERI_UZUN_SURE) {
+    tusUzun[TUS_BACK] = true;                   // 长按：进配置门户
+    ekranMesaj("进入配置模式", "请稍候");
+    delay(150);
+    portalBaslat();
+    botOlustur();
+    mesaj = "";
+    harfIndex = 0;
+    enkoderDegisim = 0;
     ekraniGuncelle();
   }
-
-  if(bildirimVar && millis()-bildirimZamani < BILDIRIM_SURE) {
-    ekraniGuncelle();
-    delay(50);
+  if (!b && backOnceki && !tusUzun[TUS_BACK]) {   // 短按
+    if (mod == 1) {
+      mod = 0;
+      ekraniGuncelle();
+    } else if (mesaj.length() > 0) {
+      int sonByte = mesaj.length() - 1;
+      while (sonByte > 0 && (mesaj[sonByte] & 0xC0) == 0x80) sonByte--;
+      mesaj = mesaj.substring(0, sonByte);
+      ekraniGuncelle();
+    }
   }
+  backOnceki = b;
 
-  if(millis()-sonKaymaZamani > KAYMA_ARALIK) {
-    sonKaymaZamani=millis(); bool g=false;
-    if(mesajGecmisi[seciliKisi][0].length()>EKRAN_KARAKTER) {
-      kaymaOffset0++;
-      if(kaymaOffset0>=(int)(mesajGecmisi[seciliKisi][0].length()+3)) kaymaOffset0=0; g=true;
-    }
-    if(mesajGecmisi[seciliKisi][1].length()>EKRAN_KARAKTER) {
-      kaymaOffset1++;
-      if(kaymaOffset1>=(int)(mesajGecmisi[seciliKisi][1].length()+3)) kaymaOffset1=0; g=true;
-    }
-    if(g) ekraniGuncelle();
+  /* ---------------- 确认键 ---------------- */
+  if (c && !tusUzun[TUS_CONF] && millis() - tusBasZaman[TUS_CONF] >= UZUN_BAS_SURE) {
+    tusUzun[TUS_CONF] = true;                   // 长按：换人
+    kisiSecildi = false;
+    mod = 0;
+    mesaj = "";
+    enkoderDegisim = 0;
+    kisiSecimEkrani();
   }
-
-  if(digitalRead(ENC_BTN)==LOW) {
-    if(mod==0) { mesaj+=String(harfler[harfIndex]); ekraniGuncelle(); }
-    delay(300);
-  }
-
-  if(digitalRead(BTN_BACK)==LOW) {
-    unsigned long bz=millis();
-    while(digitalRead(BTN_BACK)==LOW) {
-      if(millis()-bz > 3000) {
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB08_tr);
-        u8g2.drawStr(0, 30, "WiFi degistiriliyor...");
-        u8g2.sendBuffer();
-        delay(1000);
-        wifiSecimineGit();
-        return;
-      }
-    }
-    if(millis()-bz < 3000) {
-      if(mod==1) { mod=0; ekraniGuncelle(); }
-      else if(mesaj.length()>0) {
-        mesaj=mesaj.substring(0,mesaj.length()-1); ekraniGuncelle();
-      }
-    }
-    delay(300);
-  }
-
-  if(digitalRead(BTN_CONFIRM)==LOW) {
-    unsigned long cz = millis();
-    while(digitalRead(BTN_CONFIRM)==LOW) {
-      if(millis()-cz > UZUN_BAS_SURE) {
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB08_tr);
-        u8g2.drawStr(0, 30, "Kisi secimi...");
-        u8g2.sendBuffer();
-        delay(500);
-        kisiSecildi = false;
-        mesaj = "";
-        enkoderDegisim = 0;
-        kisiSecimEkrani();
-        return;
-      }
-    }
-    unsigned long simdi = millis();
-    if(millis()-cz < UZUN_BAS_SURE) {
-      if(mod==1) {
-        mesajGonder(String(hazirMesajlar[hazirMesajIndex]));
-        mod=0; hazirMesajIndex=0; delay(500); ekraniGuncelle();
+  if (!c && confOnceki && !tusUzun[TUS_CONF]) {   // 短按
+    if (mod == 1) {
+      mesajGonder(String(hazirMesajlar[hazirMesajIndex]));
+      mod = 0;
+      hazirMesajIndex = 0;
+      ekraniGuncelle();
+    } else {
+      unsigned long simdi = millis();
+      if (sonConfirmZamani != 0 && simdi - sonConfirmZamani < CIFT_TIK_ARALIK) {
+        sonConfirmZamani = 0;
+        mod = 1;
+        hazirMesajIndex = 0;
+        ekraniGuncelle();
       } else {
-        if(sonConfirmZamani != 0 && (simdi-sonConfirmZamani<CIFT_TIK_ARALIK)) {
-          sonConfirmZamani=0; mod=1; hazirMesajIndex=0; ekraniGuncelle();
-        } else {
-          sonConfirmZamani=simdi;
-        }
+        sonConfirmZamani = simdi;
       }
     }
-    delay(200);
+  }
+  confOnceki = c;
+
+  /* 单击确认 → 等双击窗口后发送 */
+  if (sonConfirmZamani != 0 && millis() - sonConfirmZamani > CIFT_TIK_ARALIK) {
+    if (mod == 0 && mesaj.length() > 0) {
+      mesajGonder(mesaj);
+      mesaj = "";
+      harfIndex = 0;
+    }
+    sonConfirmZamani = 0;
   }
 
-  if(sonConfirmZamani != 0 && (millis()-sonConfirmZamani>CIFT_TIK_ARALIK)) {
-    if(mod==0 && mesaj.length()>0) {
-      mesajGonder(mesaj); mesaj=""; harfIndex=0; delay(500); ekraniGuncelle();
+  /* ---------------- 新消息提示闪烁 ---------------- */
+  if (bildirimVar) {
+    if (millis() - bildirimZamani >= BILDIRIM_SURE) {
+      bildirimVar = false;
+      ekraniGuncelle();
+    } else if (millis() - sonCizim >= 250) {
+      ekraniGuncelle();
     }
-    sonConfirmZamani=0;
   }
 
-  // ===== TELEGRAM KONTROL =====
-  if(millis()-sonTelegramKontrol > TELEGRAM_ARALIK) {
-    if(WiFi.status()==WL_CONNECTED) {
-      int ms=bot.getUpdates(bot.last_message_received+1);
-      if(ms>0) {
-        for(int i=0;i<ms;i++) {
-          String chatID = bot.messages[i].chat_id;
-          String fromID = bot.messages[i].from_id;
-          int kisiIndex = chatIDdenKisiIndex(chatID, fromID);
-          if(kisiIndex >= 0) {
-            mesajEkle(bot.messages[i].text, "o", kisiIndex);
-            if(!aktifKisidanMi(kisiIndex)) {
-              bildirimVar = true;
-              bildirimZamani = millis();
-            }
-          }
-        }
-        telegramBagli=true; sonBasariliIstek=millis(); gelenSes(); ekraniGuncelle();
-      }
-      if(millis()-sonBasariliIstek>15000) telegramBagli=false;
+  /* ---------------- 长文本滚动 ---------------- */
+  if (mod == 0 && millis() - sonKaymaZamani > KAYMA_ARALIK) {
+    sonKaymaZamani = millis();
+    bool guncelle = false;
+
+    String s0 = mesajSatiri(0);
+    String s1 = mesajSatiri(1);
+    if (s0.length() && metinGenisligi(s0) > 124) {
+      kaymaOffset0 += 2;
+      if (kaymaOffset0 >= metinGenisligi(s0 + "     ")) kaymaOffset0 = 0;
+      guncelle = true;
     }
-    sonTelegramKontrol=millis();
+    if (s1.length() && metinGenisligi(s1) > 124) {
+      kaymaOffset1 += 2;
+      if (kaymaOffset1 >= metinGenisligi(s1 + "     ")) kaymaOffset1 = 0;
+      guncelle = true;
+    }
+    if (guncelle) ekraniGuncelle();
   }
 }
