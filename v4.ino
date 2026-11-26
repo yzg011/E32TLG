@@ -1,4 +1,4 @@
-/* ============================================================================
+  /* ============================================================================
    E32TLG 中文版 v2‑HTTPClient 长轮询版 + 标题栏时分显示
    ESP32 + SH1106 128x64 (I2C) + 旋转编码器 + Telegram 家庭留言机
    ✔ 完全移除 UniversalTelegramBot，使用 HTTPClient 实现 getUpdates 长轮询
@@ -41,7 +41,7 @@
 #define UZUN_BAS_SURE    2000      // 确认键长按
 #define GERI_UZUN_SURE   3000      // 返回键长按
 #define TUS_DEBOUNCE     15        // 按键去抖
-#define BILDIRIM_SURE    60000      // 新消息提示时长
+#define BILDIRIM_SURE    5000      // 新消息提示时长
 #define KAYMA_ARALIK     300       // 长文本滚动间隔
 #define TUSBAS_TEKRAR    60        // 编码器键防连击
 #define TZ_OFFSET        28800     // UTC+8 8*3600
@@ -460,7 +460,6 @@ void kisiSecimEkrani() {
     u8g2.drawUTF8(3, 63, kisiIsimleri[seciliKisi + 1].c_str());
   u8g2.sendBuffer();
   sonCizim = millis();
-  sonSaatCizim = millis();
 }
 
 void apCallback(WiFiManager *m) {
@@ -739,7 +738,7 @@ void wifiBaslat() {
   Serial.println("[WiFi] " + WiFi.SSID() + " -> " + ip);
 
   // NTP 同步时间
-  configTime(TZ_OFFSET, 0, "ntp.aliyun.com", "ntp1.aliyun.com");
+  configTime(TZ_OFFSET, 0, "ntp.aliyun.com", "time.windows.com");
   timeSynced = false;
   for(int i=0;i<10;i++){
     if(getLocalTime(&timeinfo)){
