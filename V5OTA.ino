@@ -7,6 +7,7 @@
    ✔ 保留全部原有UI、按键、WiFiManager配置、NVS存储、蜂鸣器
    ✔ 新增：标题栏 HH:MM 网络时间，放在标题文字和右上角图标中间
    ✔ 新增：巴法云 TCP 创客云 OTA —— 主题收到消息 "update" 才开始下载固件升级
+   ✔ 新增：设备在线检查
    依赖库
      U8g2 >= 2.35 / WiFiManager >= 2.0.17 / ArduinoJson >= 6
      HTTPUpdate（ESP32 Arduino Core 内置，无需额外安装）
@@ -230,6 +231,27 @@ void kaydetParametreler() {
 /* =========================================================================
    二、Telegram 后台任务（运行在 core 0，HTTPClient getUpdates长轮询）
    ========================================================================= */
+
+void sendTgAck(String chatId, String msg) {
+  HTTPClient ackHttp;
+  String ackUrl = "https://tg.z2m.store/bot" + botToken + "/sendMessage";
+  ackHttp.begin(ackUrl);
+  ackHttp.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument ackDoc(512);
+  ackDoc["chat_id"] = chatId;
+  ackDoc["text"] = msg;
+  String ackBuf;
+  serializeJson(ackDoc, ackBuf);
+
+  ackHttp.POST(ackBuf);
+  ackHttp.end();
+}
+
+
+
+
+
 int chatIDdenKisiIndex(String chatID, String fromID) {
   for (int i = 0; i < KISI_SAYISI; i++) {
     if (chatIDleri[i].length() > 0 && chatID == chatIDleri[i]) return i;
@@ -341,6 +363,17 @@ void tgGorevi(void *param) {
             String fromIdStr = msg["from"]["id"].as<String>();
             String textRaw = msg["text"].as<String>();
 
+          // /start 判断
+          if (textRaw == "/start") {
+           if(telegramBagli){
+           sendTgAck(chatIdStr, "✅ 设备在线");
+          }
+          continue;
+          }
+
+
+
+
             if(textRaw.length()>180) textRaw = textRaw.substring(0,180);
 
             int idx = chatIDdenKisiIndex(chatIdStr, fromIdStr);
@@ -370,6 +403,9 @@ void tgGorevi(void *param) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
+
+
+
 
 /* =========================================================================
    三、显示辅助
